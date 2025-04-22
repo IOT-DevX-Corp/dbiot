@@ -1,97 +1,125 @@
 import { useState, useEffect } from "react";
-import { FaBell, FaCheckCircle, FaExclamationTriangle, FaSyncAlt } from "react-icons/fa";
+import { FaBell, FaCheckCircle, FaExclamationTriangle } from "react-icons/fa";
 import { database } from '../../firebase';
-import { ref, onValue, query, orderByChild, limitToLast } from 'firebase/database';
-import { setupNotifications, sendNotification } from '../../services/notificationService';
+import { ref, onValue } from 'firebase/database';
+import { formatTimeFromDate } from '../../utils/timeUtils';
 
 export default function Notification({ onClose }) {
     const [activeTab, setActiveTab] = useState("All");
     const [notifications, setNotifications] = useState([]);
-    const [loading, setLoading] = useState(true);
+    const [medications, setMedications] = useState({});
+    const [permissionGranted, setPermissionGranted] = useState(false);
 
     useEffect(() => {
-        setupNotifications();
+        // Request notification permission properly
+        const requestNotificationPermission = async () => {
+            try {
+                if ('Notification' in window) {
+                    const permission = await window.Notification.requestPermission();
+                    setPermissionGranted(permission === 'granted');
+                }
+            } catch (error) {
+                console.error('Error requesting notification permission:', error);
+            }
+        };
 
-        // Request notification permission
-        if ('Notification' in window) {
-            Notification.requestPermission();
-        }
+        requestNotificationPermission();
 
-        // Reference to medications and dispenser
+        // Listen for medication updates
         const medicationsRef = ref(database, 'medications');
-        const dispenserRef = ref(database, 'pillDispenser');
-
-        // Listen for medication changes
-        const medicationUnsubscribe = onValue(medicationsRef, (snapshot) => {
+        const unsubscribe = onValue(medicationsRef, (snapshot) => {
             if (snapshot.exists()) {
                 const medicationsData = snapshot.val();
-                Object.entries(medicationsData).forEach(([key, med]) => {
-                    // Check if medication time is now
-                    const now = new Date();
-                    if (med.hour === now.getHours() && med.minute === now.getMinutes()) {
-                        createNotification({
-                            id: key,
-                            type: "reminder",
-                            icon: <FaBell className="text-blue-500" />,
-                            title: `Time to take ${med.name}`,
-                            message: `Your ${med.hour}:${med.minute.toString().padStart(2, '0')} dose is ready`,
-                            time: `${med.hour}:${med.minute.toString().padStart(2, '0')} • Today`,
-                            bg: "bg-blue-100",
-                        });
-                    }
-                });
+                setMedications(medicationsData);
+                checkMedicationTimes(medicationsData);
             }
         });
 
-        // Listen for dispenser status
-        const dispenserUnsubscribe = onValue(dispenserRef, (snapshot) => {
-            if (snapshot.exists()) {
-                const dispenserData = snapshot.val();
-                // Check dispenser status
-                if (!dispenserData.isOnline) {
-                    createNotification({
-                        type: "system",
-                        icon: <FaExclamationTriangle className="text-orange-500" />,
-                        title: "Dispenser Offline",
-                        message: "Your dispenser is currently offline",
-                        time: new Date().toLocaleTimeString(),
-                        bg: "bg-orange-100",
-                    });
-                }
-                // Check last dispense status
-                if (dispenserData.lastDispenseTime && !dispenserData.lastDispenseSuccessful) {
-                    createNotification({
-                        type: "system",
-                        icon: <FaExclamationTriangle className="text-red-500" />,
-                        title: "Dispense Failed",
-                        message: `Last dispense attempt at ${dispenserData.lastDispenseTime} failed`,
-                        time: dispenserData.lastDispenseTime,
-                        bg: "bg-red-100",
-                    });
-                }
+        // Check medications every minute
+        const intervalId = setInterval(() => {
+            if (medications) {
+                checkMedicationTimes(medications);
             }
-        });
-
-        setLoading(false);
+        }, 60000);
 
         return () => {
-            medicationUnsubscribe();
-            dispenserUnsubscribe();
+            unsubscribe();
+            clearInterval(intervalId);
         };
     }, []);
 
-    const createNotification = async (notificationData) => {
-        // Add to notifications state
-        setNotifications(prev => [
-            { ...notificationData, id: Date.now() },
-            ...prev
-        ]);
+    const checkMedicationTimes = (medicationsData) => {
+        if (!medicationsData) return;
 
-        // Send browser notification
-        await sendNotification(notificationData.title, {
-            body: notificationData.message,
-            icon: '/favicon.ico'
+        const now = new Date();
+        const currentHour = now.getHours();
+        const currentMinute = now.getMinutes();
+
+        Object.entries(medicationsData).forEach(([id, med]) => {
+            // Check if it's time for medication
+            if (med.hour === currentHour && med.minute === currentMinute && !med.dispensed) {
+                sendMedicationNotification(med);
+            }
+
+            // Check for missed medications (past due)
+            if (!med.dispensed && (
+                med.hour < currentHour || 
+                (med.hour === currentHour && med.minute < currentMinute)
+            )) {
+                sendMissedMedicationNotification(med);
+            }
         });
+    };
+
+    const sendMedicationNotification = (medication) => {
+        const notificationData = {
+            id: Date.now(),
+            type: "reminder",
+            title: `Time to take ${medication.name}`,
+            message: `Your medication in Chamber ${medication.chamber} is due now`,
+            icon: <FaBell className="text-blue-500" />,
+            time: formatTimeFromDate(new Date()),
+            bg: "bg-blue-100"
+        };
+
+        // Browser notification
+        if (permissionGranted) {
+            try {
+                new window.Notification(notificationData.title, {
+                    body: notificationData.message,
+                    icon: '/favicon.ico',
+                    requireInteraction: true,
+                    tag: `med-${medication.chamber}`
+                });
+            } catch (error) {
+                console.error('Error showing notification:', error);
+            }
+        }
+
+        // Update notifications state
+        setNotifications(prev => [notificationData, ...prev]);
+    };
+
+    const sendMissedMedicationNotification = (medication) => {
+        const notificationData = {
+            id: Date.now(),
+            type: "warning",
+            title: `Missed medication: ${medication.name}`,
+            message: `You missed your medication scheduled for ${medication.hour}:${medication.minute.toString().padStart(2, '0')}`,
+            icon: <FaExclamationTriangle className="text-orange-500" />,
+            time: formatTimeFromDate(new Date()),
+            bg: "bg-orange-100"
+        };
+
+        if (Notification.permission === 'granted') {
+            new Notification(notificationData.title, {
+                body: notificationData.message,
+                icon: '/favicon.ico',
+                requireInteraction: true
+            });
+        }
+
+        setNotifications(prev => [notificationData, ...prev]);
     };
 
     const markAllAsRead = () => {
@@ -104,12 +132,6 @@ export default function Notification({ onClose }) {
         activeTab === "All"
             ? notifications
             : notifications.filter((n) => n.type === activeTab.toLowerCase());
-
-    if (loading) {
-        return <div className="w-full h-full flex justify-center items-center">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-medical-600"></div>
-        </div>;
-    }
 
     return (
         <div className="w-full max-w-4xl mx-auto bg-white p-6 shadow-md rounded-lg">

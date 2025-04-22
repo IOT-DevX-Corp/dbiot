@@ -1,34 +1,64 @@
 import { getDatabase, ref, set } from 'firebase/database';
+import { sendEmail } from './emailService';
+import { subscribeUserToPush, sendPushNotification } from './pushNotificationService';
 
-export const setupNotifications = () => {
-    if (!('Notification' in window)) {
-        console.log('This browser does not support notifications');
-        return;
+export const setupNotifications = async () => {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        console.log('Push notifications not supported');
+        return false;
     }
 
-    if (Notification.permission !== 'granted') {
-        Notification.requestPermission();
+    try {
+        const subscription = await subscribeUserToPush();
+        return !!subscription;
+    } catch (error) {
+        console.error('Failed to setup push notifications:', error);
+        return false;
     }
 };
 
-export const sendNotification = async (title, options = {}) => {
-    if (Notification.permission === 'granted') {
-        const notification = new Notification(title, options);
-        
-        // Store notification in Firebase
-        try {
-            const db = getDatabase();
-            const notificationRef = ref(db, 'notifications/' + Date.now());
-            await set(notificationRef, {
-                title,
-                message: options.body,
-                timestamp: Date.now(),
-                read: false
+export const sendNotification = async (notification) => {
+    const db = getDatabase();
+    const notificationRef = ref(db, `notifications/${Date.now()}`);
+
+    try {
+        // Store in Firebase
+        await set(notificationRef, {
+            ...notification,
+            timestamp: Date.now(),
+            read: false
+        });
+
+        // Get push subscription
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+
+        if (subscription) {
+            // Send push notification
+            await sendPushNotification(subscription, {
+                title: notification.title,
+                body: notification.message,
+                icon: '/favicon.ico',
+                data: notification
             });
-        } catch (error) {
-            console.error('Error storing notification:', error);
         }
 
-        return notification;
+        // Show local notification as fallback
+        if (Notification.permission === 'granted') {
+            new Notification(notification.title, {
+                body: notification.message,
+                icon: '/favicon.ico'
+            });
+        }
+
+        // Send email for medication notifications
+        if (notification.type === 'medication') {
+            await sendEmail(notification.medicationData);
+        }
+
+        return true;
+    } catch (error) {
+        console.error('Notification error:', error);
+        return false;
     }
 };
